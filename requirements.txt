@@ -1,0 +1,9 @@
+pyTelegramBotAPI
+pyrogram
+tgcrypto
+yt-dlp
+pymongo
+requests
+ffmpeg-python
+python-dotenv
+Flask
