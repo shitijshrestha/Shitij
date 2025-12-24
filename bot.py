@@ -7,9 +7,9 @@ from pyrogram.errors import FloodWait
 
 from config import (
     API_ID, API_HASH, BOT_TOKEN, PERMANENT_ADMIN,
-    RECORDINGS_DIR, MAX_UPLOAD_SIZE
+    RECORDINGS_DIR, MAX_UPLOAD_SIZE, DUMP_CHANNEL_ID
 )
-from uploader import upload_video  # Use existing uploader.py
+from uploader import upload_video  # Existing uploader.py
 
 os.makedirs(RECORDINGS_DIR, exist_ok=True)
 
@@ -86,8 +86,15 @@ async def do_record(m, url, duration):
     
     await status_msg.edit("📤 Uploading to Telegram...")
     
-    # Upload via existing uploader.py
+    # Upload to command chat
     await upload_video(app, m.chat.id, outfile, caption=f"🎥 Recorded\n⏱ {duration}")
+    
+    # Upload to dump channel if set
+    try:
+        if DUMP_CHANNEL_ID:
+            await upload_video(app, DUMP_CHANNEL_ID, outfile, caption=f"🎥 Recorded\n⏱ {duration}")
+    except Exception as e:
+        await status_msg.edit(f"⚠️ Dump channel upload failed: {e}")
     
     os.remove(outfile)
     await status_msg.delete()
