@@ -1,213 +1,159 @@
 import os
-import telebot
-import subprocess
-import threading
-import datetime
-import shlex
-import time
-import requests
-from flask import Flask, request
+import json
+import asyncio
+from datetime import datetime
+from pyrogram import Client, filters
+from pyrogram.types import Message
+from pyrogram.errors import FloodWait
 
-# ================= CONFIG =================
-BOT_TOKEN = "8472411784:AAH--Dd1I45vwZcwLCi2iqav77vz8JfqpmI"
-PERMANENT_ADMIN = 6403142441
-DUMP_CHANNEL_ID = -1002627919828
-PLAYLIST_URL = "https://21dec2027-rkdyiptv.pages.dev/global.html"
-TEMP_DIR = "recordings"
-RENDER_URL = "https://xyz-36.onrender.com"   # 🔴 CHANGE IF URL CHANGES
-# =========================================
+from config import (
+    API_ID, API_HASH, BOT_TOKEN, PERMANENT_ADMIN,
+    RECORDINGS_DIR, MAX_UPLOAD_SIZE
+)
+from uploader import upload_video  # ✅ uploader.py se upload function
 
-os.makedirs(TEMP_DIR, exist_ok=True)
+os.makedirs(RECORDINGS_DIR, exist_ok=True)
 
-bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
-app = Flask(__name__)
+app = Client(
+    "iptv_recorder_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
 
-approved_users = [PERMANENT_ADMIN]
-recording_processes = {}
-playlist_dict = {}
+ADMINS = {PERMANENT_ADMIN}
+USERS = set()
+PLAYLIST_FILE = "playlist.json"
 
-# ================= WEB SERVER =================
-@app.route("/", methods=["GET"])
-def home():
-    return "IPTV Recorder Bot Running", 200
+# ---------------- HELPERS ----------------
+def is_admin(uid): return uid in ADMINS
+def is_allowed(uid): return uid in ADMINS or uid in USERS
 
-@app.route(f"/{BOT_TOKEN}", methods=["POST"])
-def webhook():
-    update = telebot.types.Update.de_json(
-        request.stream.read().decode("utf-8")
-    )
-    bot.process_new_updates([update])
-    return "OK", 200
-
-# ================= ADMIN CHECK =================
-def admin_or_approved(func):
-    def wrapper(message):
-        uid = message.from_user.id
-        if uid == PERMANENT_ADMIN or uid in approved_users:
-            return func(message)
-        bot.reply_to(message, "⛔ Access denied! Wait for admin approval.")
-    return wrapper
-
-# ================= PLAYLIST =================
 def load_playlist():
-    playlist_dict.clear()
-    r = requests.get(PLAYLIST_URL, timeout=10)
-    lines = r.text.splitlines()
-    for i in range(len(lines)):
-        if lines[i].startswith("#EXTINF"):
-            name = lines[i].split(",", 1)[1]
-            url = lines[i+1]
-            cid = str(len(playlist_dict)+1)
-            playlist_dict[cid] = {"name": name, "url": url}
+    if os.path.exists(PLAYLIST_FILE):
+        with open(PLAYLIST_FILE, "r") as f:
+            return json.load(f)
+    return {}
 
-# ================= PROGRESS =================
-def send_progress(chat_id, text):
-    try:
-        bot.send_message(chat_id, text)
-    except:
-        pass
+def save_playlist(data):
+    with open(PLAYLIST_FILE, "w") as f:
+        json.dump(data, f, indent=2)
 
-# ================= FFMPEG =================
-def run_ffmpeg(url, duration, title, chat_id):
-    ts = datetime.datetime.now().strftime("%d-%m-%Y_%H-%M-%S")
-    path = f"{TEMP_DIR}/{title}_{ts}.mp4"
+# ---------------- COMMANDS ----------------
+@app.on_message(filters.command("start"))
+async def start_cmd(_, m: Message):
+    if m.from_user.id not in USERS and not is_admin(m.from_user.id):
+        USERS.add(m.from_user.id)
+    await m.reply_text(
+        "👋 IPTV Recorder Bot\n\n"
+        "Commands:\n"
+        "/record <url> <HH:MM:SS>\n"
+        "/rec <url> <HH:MM:SS>\n"
+        "/pl <name> <url>\n"
+        "/p1 <name> <HH:MM:SS>\n"
+        "/find <name>\n"
+        "/addadmin <id>\n"
+        "/help"
+    )
 
-    cmd = ["ffmpeg", "-y", "-i", url, "-c", "copy"]
-    if duration:
-        cmd += ["-t", duration]
-    cmd.append(path)
+@app.on_message(filters.command("help"))
+async def help_cmd(_, m: Message):
+    await m.reply_text(
+        "**Help Menu**\n"
+        "/record url 00:05:00\n"
+        "/rec url 00:05:00\n"
+        "/pl name url (add playlist)\n"
+        "/p1 name 00:05:00 (record playlist)\n"
+        "/find name\n"
+        "/addadmin id"
+    )
 
-    bot.send_message(chat_id, f"🎬 Recording started: {title}")
-    p = subprocess.Popen(cmd)
-    recording_processes[chat_id] = p
+@app.on_message(filters.command("addadmin"))
+async def add_admin(_, m: Message):
+    if not is_admin(m.from_user.id):
+        return await m.reply_text("❌ Admin only")
+    if len(m.command) != 2:
+        return await m.reply_text("Usage: /addadmin <user_id>")
+    uid = int(m.command[1])
+    ADMINS.add(uid)
+    await m.reply_text(f"✅ Admin added: `{uid}`")
 
-    while p.poll() is None:
-        send_progress(chat_id, "⏳ Recording...")
-        time.sleep(30)
+@app.on_message(filters.command("pl"))
+async def add_playlist(_, m: Message):
+    if not is_admin(m.from_user.id):
+        return await m.reply_text("❌ Admin only")
+    if len(m.command) < 3:
+        return await m.reply_text("Usage: /pl <name> <url>")
+    name = m.command[1].lower()
+    url = m.command[2]
+    data = load_playlist()
+    data[name] = url
+    save_playlist(data)
+    await m.reply_text(f"✅ Playlist added: `{name}`")
 
-    try:
-        with open(path, "rb") as v:
-            bot.send_video(DUMP_CHANNEL_ID, v, caption=title)
-        with open(path, "rb") as v:
-            bot.send_video(chat_id, v, caption=title)
-        os.remove(path)
-        bot.send_message(chat_id, "✅ Upload completed")
-    except Exception as e:
-        bot.send_message(chat_id, f"❌ Upload failed: {e}")
+@app.on_message(filters.command("find"))
+async def find_playlist(_, m: Message):
+    data = load_playlist()
+    if len(m.command) != 2:
+        return await m.reply_text("Usage: /find <name>")
+    key = m.command[1].lower()
+    matches = [k for k in data if key in k]
+    if not matches:
+        return await m.reply_text("❌ No match found")
+    text = "**Found Channels:**\n" + "\n".join(f"- `{k}`" for k in matches)
+    await m.reply_text(text)
 
-# ================= COMMANDS =================
-@bot.message_handler(commands=["start"])
-def start(message):
-    uid = message.from_user.id
-    if uid == PERMANENT_ADMIN:
-        bot.reply_to(message, "👑 Admin online")
-    elif uid in approved_users:
-        bot.reply_to(message, "✅ Welcome back")
-    else:
-        bot.send_message(PERMANENT_ADMIN, f"New user: {uid}\nApprove: /addadmins {uid}")
-        bot.reply_to(message, "⏳ Approval sent")
+# ---------------- RECORD FUNCTION ----------------
+async def do_record(m, url, duration):
+    now = datetime.now().strftime("%Y%m%d_%H%M%S")
+    outfile = f"{RECORDINGS_DIR}/rec_{now}.mp4"
+    status_msg = await m.reply_text("🎬 Recording started...")
+    
+    cmd = ["ffmpeg", "-y", "-i", url, "-t", duration, "-c", "copy", outfile]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+    )
+    await proc.communicate()
+    
+    if not os.path.exists(outfile):
+        return await status_msg.edit("❌ Recording failed")
+    
+    size_mb = os.path.getsize(outfile) / (1024*1024)
+    if size_mb > MAX_UPLOAD_SIZE:
+        os.remove(outfile)
+        return await status_msg.edit("❌ File too large")
+    
+    await status_msg.edit("📤 Uploading to Telegram...")
+    
+    # ---------------- USE uploader.py ----------------
+    await upload_video(app, m.chat.id, outfile, caption=f"🎥 Recorded\n⏱ {duration}")
+    
+    os.remove(outfile)
+    await status_msg.delete()
 
-@bot.message_handler(commands=["addadmins"])
-def add_admins(message):
-    if message.from_user.id != PERMANENT_ADMIN:
-        return
-    ids = message.text.split()[1:]
-    for i in ids:
-        i = int(i)
-        if i not in approved_users:
-            approved_users.append(i)
-            bot.send_message(i, "✅ You are approved")
-    bot.reply_to(message, "Done")
+# ---------------- RECORD COMMANDS ----------------
+@app.on_message(filters.command(["record","rec"]))
+async def record_cmd(_, m: Message):
+    if not is_allowed(m.from_user.id):
+        return await m.reply_text("❌ Not allowed")
+    if len(m.command) < 3:
+        return await m.reply_text("Usage: /record <url> <HH:MM:SS>")
+    await do_record(m, m.command[1], m.command[2])
 
-@bot.message_handler(commands=["helps"])
-@admin_or_approved
-def helps(message):
-    bot.reply_to(message,
-"""📘 Commands
-/recorded <url> <duration> <title>
-/prec <channel_id> <duration> <title>
-/finds <name>
-/files
-/uploads <file>
-/deleted <file>
-/cancels
-/statuss
-""")
+@app.on_message(filters.command("p1"))
+async def playlist_record(_, m: Message):
+    if not is_allowed(m.from_user.id):
+        return await m.reply_text("❌ Not allowed")
+    if len(m.command) < 3:
+        return await m.reply_text("Usage: /p1 <name> <HH:MM:SS>")
+    name = m.command[1].lower()
+    duration = m.command[2]
+    data = load_playlist()
+    if name not in data:
+        return await m.reply_text("❌ Playlist not found")
+    await do_record(m, data[name], duration)
 
-@bot.message_handler(commands=["recorded"])
-@admin_or_approved
-def recorded(message):
-    args = shlex.split(message.text)
-    url = args[1]
-    duration = args[2]
-    title = args[3]
-    threading.Thread(target=run_ffmpeg, args=(url,duration,title,message.chat.id)).start()
-
-@bot.message_handler(commands=["prec"])
-@admin_or_approved
-def prec(message):
-    load_playlist()
-    args = shlex.split(message.text)
-    cid = args[1]
-    duration = args[2]
-    title = args[3]
-    ch = playlist_dict.get(cid)
-    if not ch:
-        return bot.reply_to(message, "Invalid channel ID")
-    threading.Thread(target=run_ffmpeg, args=(ch["url"],duration,title,message.chat.id)).start()
-
-@bot.message_handler(commands=["finds"])
-@admin_or_approved
-def finds(message):
-    load_playlist()
-    q = message.text.split(maxsplit=1)[1].lower()
-    res = []
-    for k,v in playlist_dict.items():
-        if q in v["name"].lower():
-            res.append(f"{k} - {v['name']}")
-    bot.reply_to(message, "\n".join(res) if res else "No result")
-
-@bot.message_handler(commands=["files"])
-@admin_or_approved
-def files(message):
-    bot.reply_to(message, "\n".join(os.listdir(TEMP_DIR)) or "Empty")
-
-@bot.message_handler(commands=["deleted"])
-@admin_or_approved
-def deleted(message):
-    f = message.text.split()[1]
-    p = f"{TEMP_DIR}/{f}"
-    if os.path.exists(p):
-        os.remove(p)
-        bot.reply_to(message, "Deleted")
-
-@bot.message_handler(commands=["uploads"])
-@admin_or_approved
-def uploads(message):
-    f = message.text.split()[1]
-    p = f"{TEMP_DIR}/{f}"
-    with open(p,"rb") as v:
-        bot.send_video(message.chat.id, v)
-    os.remove(p)
-
-@bot.message_handler(commands=["cancels"])
-@admin_or_approved
-def cancels(message):
-    p = recording_processes.get(message.chat.id)
-    if p:
-        p.terminate()
-        bot.reply_to(message, "Canceled")
-
-@bot.message_handler(commands=["statuss"])
-@admin_or_approved
-def statuss(message):
-    p = recording_processes.get(message.chat.id)
-    bot.reply_to(message, "Recording running" if p and p.poll() is None else "Idle")
-
-# ================= WEBHOOK SET =================
-bot.remove_webhook()
-bot.set_webhook(url=f"{RENDER_URL}/{BOT_TOKEN}")
-
-# ================= RUN =================
+# ---------------- RUN ----------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    print("✅ IPTV Recorder Bot running...")
+    app.run()
